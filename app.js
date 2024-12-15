@@ -3,15 +3,57 @@ var express = require('express');
 var app = express();
 var crontab = require("./crontab");
 var restore = require("./restore");
+var package_json = require('./package.json');
 var moment = require('moment');
+var basicAuth = require('express-basic-auth');
+var http = require('http');
+var https = require('https');
 
 var path = require('path');
 var mime = require('mime-types');
 var fs = require('fs');
 var busboy = require('connect-busboy'); // for file upload
 
+// base url
+var base_url = require("./routes").base_url
+app.locals.baseURL = base_url
+
+// basic auth
+var BASIC_AUTH_USER = process.env.BASIC_AUTH_USER;
+var BASIC_AUTH_PWD = process.env.BASIC_AUTH_PWD;
+
+if (BASIC_AUTH_USER && BASIC_AUTH_PWD) {
+    app.use(function(req, res, next) {
+        res.setHeader('WWW-Authenticate', 'Basic realm="Restricted Area"')
+        next();
+    });
+
+	app.use(basicAuth({
+        users: {
+            [BASIC_AUTH_USER]: BASIC_AUTH_PWD
+        }
+    }))
+}
+
+// ssl credentials
+var credentials = {
+  key: process.env.SSL_KEY ? fs.readFileSync(process.env.SSL_KEY) : '',
+  cert: process.env.SSL_CERT ? fs.readFileSync(process.env.SSL_CERT) : '',
+}
+
+if (
+  (credentials.key && !credentials.cert) ||
+  (credentials.cert && !credentials.key)
+) {
+    console.error('Please provide both SSL_KEY and SSL_CERT');
+    process.exit(1);
+  }
+
+var startHttpsServer = credentials.key && credentials.cert;
+
 // include the routes
 var routes = require("./routes").routes;
+var routes_relative = require("./routes").relative
 
 // set the view engine to ejs
 app.set('view engine', 'ejs');
@@ -24,10 +66,10 @@ app.use(bodyParser.urlencoded({     // to support URL-encoded bodies
 app.use(busboy()); // to support file uploads
 
 // include all folders
-app.use(express.static(__dirname + '/public'));
-app.use(express.static(__dirname + '/public/css'));
-app.use(express.static(__dirname + '/public/js'));
-app.use(express.static(__dirname + '/config'));
+app.use(base_url, express.static(__dirname + '/public'));
+app.use(base_url, express.static(__dirname + '/public/css'));
+app.use(base_url, express.static(__dirname + '/public/js'));
+app.use(base_url, express.static(__dirname + '/config'));
 app.set('views', __dirname + '/views');
 
 // set host to 127.0.0.1 or the value set by environment var HOST
@@ -43,7 +85,7 @@ app.get(routes.root, function(req, res) {
 	// send all the required parameters
 	crontab.crontabs( function(docs){
 		res.render('index', {
-			routes : JSON.stringify(routes),
+			routes : JSON.stringify(routes_relative),
 			crontabs : JSON.stringify(docs),
 			backups : crontab.get_backup_names(),
 			env : crontab.get_env(),
@@ -103,8 +145,10 @@ app.get(routes.crontab, function(req, res, next) {
 
 // backup crontab db
 app.get(routes.backup, function(req, res) {
-	crontab.backup();
-	res.end();
+	crontab.backup((err) => {
+		if (err) next(err);
+		else res.end();
+	});
 });
 
 // This renders the restore page similar to backup page
@@ -112,7 +156,7 @@ app.get(routes.restore, function(req, res) {
 	// get all the crontabs
 	restore.crontabs(req.query.db, function(docs){
 		res.render('restore', {
-			routes : JSON.stringify(routes),
+			routes : JSON.stringify(routes_relative),
 			crontabs : JSON.stringify(docs),
 			backups : crontab.get_backup_names(),
 			db: req.query.db
@@ -134,7 +178,7 @@ app.get(routes.restore_backup, function(req, res) {
 
 // export current crontab db so that user can download it
 app.get(routes.export, function(req, res) {
-	var file = __dirname + '/crontabs/crontab.db';
+	var file = crontab.crontab_db_file;
 
 	var filename = path.basename(file);
 	var mimetype = mime.lookup(file);
@@ -151,7 +195,7 @@ app.post(routes.import, function(req, res) {
 	var fstream;
 	req.pipe(req.busboy);
 	req.busboy.on('file', function (fieldname, file, filename) {
-		fstream = fs.createWriteStream(__dirname + '/crontabs/crontab.db');
+		fstream = fs.createWriteStream(crontab.crontab_db_file);
 		file.pipe(fstream);
 		fstream.on('close', function () {
 			crontab.reload_db();
@@ -166,13 +210,23 @@ app.get(routes.import_crontab, function(req, res) {
 	res.end();
 });
 
-// get the log file a given job. id passed as query param
-app.get(routes.logger, function(req, res) {
-	_file = crontab.log_folder +"/"+req.query.id+".log";
-	if (fs.existsSync(_file))
-		res.sendFile(_file);
+function sendLog(path, req, res) {
+	if (fs.existsSync(path))
+		res.sendFile(path);
 	else
 		res.end("No errors logged yet");
+}
+
+// get the log file a given job. id passed as query param
+app.get(routes.logger, function(req, res) {
+	let _file = crontab.log_folder + "/" + req.query.id + ".log";
+	sendLog(_file, req, res);
+});
+
+// get the log file a given job. id passed as query param
+app.get(routes.stdout, function(req, res) {
+	let _file = crontab.log_folder + "/" + req.query.id + ".stdout.log";
+	sendLog(_file, req, res);
 });
 
 // error handler
@@ -186,7 +240,7 @@ app.use(function(err, req, res, next) {
 		data.stack = err.stack;
 	}
 
-	if (parseInt(data.statusCode) >= 500) {
+	if (statusCode >= 500) {
 		console.error(err);
 	}
 
@@ -203,19 +257,22 @@ process.on('SIGTERM', function() {
   process.exit();
 })
 
-app.listen(app.get('port'), app.get('host'), function() {
+var server = startHttpsServer ?
+  https.createServer(credentials, app) : http.createServer(app);
+
+server.listen(app.get('port'), app.get('host'), function() {
   console.log("Node version:", process.versions.node);
-  fs.access(__dirname + "/crontabs/", fs.W_OK, function(err) {
+  fs.access(crontab.db_folder, fs.W_OK, function(err) {
     if(err){
-      console.error("Write access to", __dirname + "/crontabs/", "DENIED.");
+      console.error("Write access to", crontab.db_folder, "DENIED.");
       process.exit(1);
     }
   });
   // If --autosave is used then we will also save whatever is in the db automatically without having to mention it explictly
   // we do this by watching log file and setting a on change hook to it
-  if (process.argv.includes("--autosave")){
+  if (process.argv.includes("--autosave") || process.env.ENABLE_AUTOSAVE) {
     crontab.autosave_crontab(()=>{});
-    fs.watchFile(__dirname + '/crontabs/crontab.db', () => {
+    fs.watchFile(crontab.crontab_db_file, () => {
       crontab.autosave_crontab(()=>{
         console.log("Attempted to autosave crontab");
       });
@@ -223,8 +280,8 @@ app.listen(app.get('port'), app.get('host'), function() {
   }
   if (process.argv.includes("--reset")){
     console.log("Resetting crontab-ui");
-    var crontabdb = __dirname + "/crontabs/crontab.db";
-    var envdb = __dirname + "/crontabs/env.db";
+    var crontabdb = crontab.crontab_db_file;
+    var envdb = crontab.env_file;
 
     console.log("Deleting " + crontabdb);
     try{
@@ -242,5 +299,7 @@ app.listen(app.get('port'), app.get('host'), function() {
 
     crontab.reload_db();
   }
-	console.log("Crontab UI is running at http://" + app.get('host') + ":" + app.get('port'));
+
+  var protocol = startHttpsServer ? "https" : "http";
+  console.log("Crontab UI (" + package_json.version + ") is running at " + protocol + "://" + app.get('host') + ":" + app.get('port') + base_url);
 });
